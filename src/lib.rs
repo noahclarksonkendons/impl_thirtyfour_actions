@@ -8,6 +8,7 @@ use syn::punctuated::Punctuated;
 use syn::token::Comma;
 use syn::{DeriveInput, parse_macro_input, spanned::Spanned};
 
+/// Parse method lists for field-specific attributes
 struct ElementMethods {
     methods: Vec<String>,
 }
@@ -32,15 +33,43 @@ impl Parse for ElementMethods {
     }
 }
 
+/// Parse method lists for global attributes
+struct GlobalMethods {
+    methods: Vec<String>,
+}
+
+impl Parse for GlobalMethods {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        // Expect the keyword "global"
+        let ident: Ident = input.parse()?;
+        if ident != "global" {
+            return Err(syn::Error::new(ident.span(), "expected 'global'"));
+        }
+
+        // Parse the parenthesized content
+        let content;
+        syn::parenthesized!(content in input);
+
+        // Parse comma-separated identifiers
+        let method_names = Punctuated::<Ident, Comma>::parse_terminated(&content)?;
+        let methods = method_names.into_iter().map(|id| id.to_string()).collect();
+
+        Ok(GlobalMethods { methods })
+    }
+}
+
 /// The custom derive macro automatically generates asynchronous helper methods for web elements.
 ///
 /// For every field in the struct, it always generates a base query method named:
 ///     query_<field>(&self, driver: &thirtyfour::WebDriver)
 ///
-/// If a field is annotated with the attribute:
-///     #[thirtyfour_actions(methods(click, enter_keys, get_text, etc))]
+/// Global methods can be specified at the struct level:
+///     #[thirtyfour_actions(global(click, is_displayed))]
 ///
-/// then additional methods are generated for each requested action.
+/// Field-specific methods can be added:
+///     #[thirtyfour_actions(methods(enter_keys, clear))]
+///
+/// Global methods are applied to ALL fields, and can be combined with field-specific methods.
 #[proc_macro_derive(ImplThirtyfourActions, attributes(thirtyfour_actions))]
 pub fn impl_thirtyfour_actions(input: TokenStream) -> TokenStream {
     let input_parsed = parse_macro_input!(input as DeriveInput);
@@ -48,6 +77,22 @@ pub fn impl_thirtyfour_actions(input: TokenStream) -> TokenStream {
     let struct_name = input_parsed.ident;
 
     let mut methods = Vec::new();
+
+    // Extract global methods from struct attributes
+    let mut global_methods = Vec::new();
+    for attr in &input_parsed.attrs {
+        if attr.path().is_ident("thirtyfour_actions") {
+            match attr.parse_args::<GlobalMethods>() {
+                Ok(parsed) => {
+                    global_methods.extend(parsed.methods);
+                }
+                Err(_) => {
+                    // It's not a global attribute, might be something else
+                    continue;
+                }
+            }
+        }
+    }
 
     if let syn::Data::Struct(data_struct) = input_parsed.data {
         for field in data_struct.fields {
@@ -73,13 +118,15 @@ pub fn impl_thirtyfour_actions(input: TokenStream) -> TokenStream {
                 };
                 methods.push(query_method);
 
-                // Try to parse any extra methods from the attribute.
-                let mut extra_methods = Vec::new();
+                // Combine global methods with field-specific methods
+                let mut all_methods = global_methods.clone();
+
+                // Add field-specific methods
                 for attr in &field.attrs {
                     if attr.path().is_ident("thirtyfour_actions") {
                         match attr.parse_args::<ElementMethods>() {
                             Ok(parsed) => {
-                                extra_methods.extend(parsed.methods);
+                                all_methods.extend(parsed.methods);
                             }
                             Err(e) => {
                                 return syn::Error::new(
@@ -93,9 +140,13 @@ pub fn impl_thirtyfour_actions(input: TokenStream) -> TokenStream {
                     }
                 }
 
-                // For each extra method requested, generate its implementation.
-                for extra in extra_methods {
-                    match extra.as_str() {
+                // Ensure we don't have duplicate methods
+                all_methods.sort();
+                all_methods.dedup();
+
+                // For each method requested, generate its implementation.
+                for method_name in all_methods {
+                    match method_name.as_str() {
                         // Basic element interactions
                         "click" => {
                             let click_fn_ident = syn::Ident::new(
@@ -624,7 +675,7 @@ pub fn impl_thirtyfour_actions(input: TokenStream) -> TokenStream {
                                 field_ident.span(),
                                 format!(
                                     "Unsupported thirtyfour_actions method: '{}' for field {}",
-                                    extra, field_name_str
+                                    method_name, field_name_str
                                 ),
                             )
                             .to_compile_error()
